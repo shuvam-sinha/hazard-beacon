@@ -68,17 +68,23 @@ void setup() {
 
 void loop() {
   //ask the camera driver for a pointer to a captured frame buffer
-  camera_fb_t *fb = esp_camera_fb_get(); 
+  camera_fb_t *fb = esp_camera_fb_get();
 
   if (!fb) {
     Serial.println("ERROR: Frame capture failed");
     delay(1000);
     return;
   }
-  //print properties of frame to serial monitor
-  Serial.printf("Frame captured: %d x %d | size: %d bytes\n",
-                   fb->width, fb->height, fb->len);
 
-  esp_camera_fb_return(fb); //return the frame buffer back to driver, so it doesn't fill up
-  delay(500); //2 frames per second
+  // Send frame start marker so Python knows a new frame is coming
+  Serial.println("FRAME_START");
+
+  // Send raw pixel bytes directly over serial
+  Serial.write(fb->buf, fb->len);
+
+  // Send frame end marker so Python knows the frame is complete
+  Serial.println("FRAME_END");
+
+  esp_camera_fb_return(fb);
+  delay(500);
 }
