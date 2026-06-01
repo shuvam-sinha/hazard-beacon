@@ -23,7 +23,7 @@ SERIAL_PORT   = "/dev/cu.usbmodem1101"   # The port your ESP32 is connected to o
 BAUD_RATE     = 115200                   # Must match Serial.begin() in your firmware
 IMG_WIDTH     = 96                       # Frame width in pixels — must match FRAMESIZE_96X96
 IMG_HEIGHT    = 96                       # Frame height in pixels — must match FRAMESIZE_96X96
-FRAME_BYTES   = IMG_WIDTH * IMG_HEIGHT   # Total bytes per frame (9216 for 96x96 grayscale)
+#FRAME_BYTES   = IMG_WIDTH * IMG_HEIGHT   # Total bytes per frame (9216 for 96x96 grayscale)
 MAX_FRAMES    = 50                       # How many frames to capture before stopping
 OUTPUT_DIR    = os.path.expanduser(      # Where to save the captured PNG files
     "~/Documents/hazard_beacon/dataset/raw/test_captures"
@@ -52,16 +52,18 @@ while frame_count < MAX_FRAMES:
     line = ser.readline().decode("utf-8", errors="ignore").strip()
 
     # Check if this line is the start marker sent by the ESP32
-    if line == "FRAME_START":
+    if line.startswith("FRAME_START:"):
+        parts = line.split(":")
+        frame_bytes = int(parts[1])
 
         # Read exactly FRAME_BYTES (9216) raw bytes — this is the pixel data
-        raw = ser.read(FRAME_BYTES)
+        raw = ser.read(frame_bytes)
 
         # Read the next line — it should be FRAME_END confirming the frame is complete
-        end_marker = ser.readline().decode("utf-8", errors="ignore").strip()
+        #end_marker = ser.readline().decode("utf-8", errors="ignore").strip()
 
         # Verify we got the right number of bytes and the correct end marker
-        if len(raw) == FRAME_BYTES and end_marker == "FRAME_END":
+        if len(raw) == frame_bytes:
 
             # Convert the raw bytes into a numpy array of unsigned 8-bit integers
             # Each value is one pixel brightness: 0 = black, 255 = white
@@ -83,7 +85,7 @@ while frame_count < MAX_FRAMES:
 
         else:
             # Something went wrong — wrong byte count or missing end marker
-            print(f"WARNING: Bad frame — got {len(raw)} bytes, end marker: '{end_marker}' — skipping")
+            print(f"WARNING: Bad frame — got {len(raw)} bytes")
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 

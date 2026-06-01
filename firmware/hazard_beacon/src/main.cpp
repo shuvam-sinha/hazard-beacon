@@ -55,7 +55,7 @@ void setup() {
   config.grab_mode    = CAMERA_GRAB_LATEST; //grab most recent frame
 
   //initialize the camera
-  esp_err_t err = esp_camera_init(&config); //pass the config struxt by reference and store the result
+  esp_err_t err = esp_camera_init(&config); //pass the config struct by reference and store the result
   if (err != ESP_OK) {
     Serial.printf("Camera init FAILED with error: 0x%x\n", err);
     Serial.println("Check camera pin definitions and connections.");
@@ -77,13 +77,9 @@ void loop() {
   }
 
   // Send frame start marker so Python knows a new frame is coming
-  Serial.println("FRAME_START");
-
+  Serial.printf("FRAME_START:%d\n", fb->len);
   // Send raw pixel bytes directly over serial
   Serial.write(fb->buf, fb->len);
-
-  // Send frame end marker so Python knows the frame is complete
-  Serial.println("FRAME_END");
 
   esp_camera_fb_return(fb);
   delay(500);
