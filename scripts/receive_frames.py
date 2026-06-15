@@ -19,33 +19,48 @@ import time            # Used to generate unique timestamps for filenames
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-SERIAL_PORT   = "/dev/cu.usbmodem1101"   # The port your ESP32 is connected to on Mac
-BAUD_RATE     = 115200                   # Must match Serial.begin() in your firmware
-IMG_WIDTH     = 96                       # Frame width in pixels — must match FRAMESIZE_96X96
-IMG_HEIGHT    = 96                       # Frame height in pixels — must match FRAMESIZE_96X96
-#FRAME_BYTES   = IMG_WIDTH * IMG_HEIGHT   # Total bytes per frame (9216 for 96x96 grayscale)
-MAX_FRAMES    = 50                       # How many frames to capture before stopping
-OUTPUT_DIR    = os.path.expanduser(      # Where to save the captured PNG files
-    "~/Documents/hazard_beacon/dataset/raw/test_captures"
-)
+SERIAL_PORT = "/dev/cu.usbmodem1101"   # The port your ESP32 is connected to on Mac
+BAUD_RATE   = 115200                   # Must match Serial.begin() in your firmware
+IMG_WIDTH   = 96                       # Frame width in pixels — must match FRAMESIZE_96X96
+IMG_HEIGHT  = 96                       # Frame height in pixels — must match FRAMESIZE_96X96
+
+CLASS_DIRS = {
+    "1": os.path.expanduser("~/Documents/hazard_beacon/dataset/processed/hazard_present"),
+    "2": os.path.expanduser("~/Documents/hazard_beacon/dataset/processed/ambient_noise"),
+}
+
+# ── Session prompt ────────────────────────────────────────────────────────────
+
+print("What are you capturing?")
+print("  1 — Hazard present (person/animal walking through IR zone)")
+print("  2 — Ambient noise  (empty scene, nothing in IR zone)")
+choice = input("Enter 1 or 2: ").strip()
+
+while choice not in CLASS_DIRS:
+    choice = input("Invalid choice. Enter 1 or 2: ").strip()
+
+OUTPUT_DIR = CLASS_DIRS[choice]
+label      = "hazard_present" if choice == "1" else "ambient_noise"
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
-# Create the output directory if it doesn't already exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+print(f"\nCapturing: {label}")
 print(f"Saving frames to: {OUTPUT_DIR}")
 
 # Open the serial connection to the ESP32
 # timeout=5 means if no data arrives in 5 seconds, stop waiting and move on
 ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=5)
 print(f"Connected to {SERIAL_PORT} at {BAUD_RATE} baud")
-print(f"Waiting for frames... (capturing {MAX_FRAMES} frames then stopping)\n")
+print(f"Waiting for frames... (press Ctrl+C to stop)\n")
 
 # ── Frame Capture Loop ────────────────────────────────────────────────────────
 
 frame_count = 0   # Track how many frames we've successfully saved
 
-while frame_count < MAX_FRAMES:
+end_time = time.time()+(30*60)
+
+while (time.time() <= end_time):
 
     # Read one line of text from serial and decode it from bytes to a string
     # strip() removes the trailing newline character (\n) at the end
@@ -81,7 +96,7 @@ while frame_count < MAX_FRAMES:
             cv2.imwrite(filepath, img)
 
             frame_count += 1   # Increment our counter
-            print(f"[{frame_count}/{MAX_FRAMES}] Saved: {filename}")
+            print(f"[{frame_count}] Saved: {filename}")
 
         else:
             # Something went wrong — wrong byte count or missing end marker

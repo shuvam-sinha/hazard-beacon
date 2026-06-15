@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Dataset images — too large for git, manage separately
+dataset/processed/
+dataset/processed_backup/
+dataset/raw/nightowls/
+dataset/raw/iwildcam/
+dataset/raw/wellington/
+dataset/raw/exdark/
+
+# PlatformIO build output
+firmware/hazard_beacon/.pio/
+
+# Python
+__pycache__/
+*.pyc
