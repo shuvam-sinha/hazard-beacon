@@ -96,7 +96,7 @@ __attribute__((weak)) void ei_printf_float(float f) {
 }
 
 // Allocate from PSRAM first (8MB available on ESP32-S3-EYE) so the
-// 248KB tensor arena fits. Falls back to internal RAM if PSRAM is full.
+// tensor arena fits. Falls back to internal RAM if PSRAM is full.
 // 16-byte alignment is required for CMSIS-NN SIMD operations.
 __attribute__((weak)) void *ei_malloc(size_t size) {
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
@@ -110,21 +110,11 @@ __attribute__((weak)) void *ei_malloc(size_t size) {
 
 __attribute__((weak)) void *ei_calloc(size_t nitems, size_t size) {
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
-    // Round up to 16-byte multiple so CMSIS-NN SIMD ops don't overrun the allocation.
-    // AllocatePersistentBufferImpl calculates alignment padding when checking arena fit
-    // but calls ei_calloc(bytes, 1) without that padding — so we compensate here.
     size_t total = ((nitems * size) + 15) & ~15u;
     void *ptr = heap_caps_aligned_alloc(16, total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (ptr) {
-        memset(ptr, 0, total);
-        return ptr;
-    }
-    // Fallback: internal RAM
+    if (ptr) { memset(ptr, 0, total); return ptr; }
     ptr = heap_caps_aligned_alloc(16, total, MALLOC_CAP_DEFAULT);
-    if (ptr) {
-        memset(ptr, 0, total);
-        return ptr;
-    }
+    if (ptr) { memset(ptr, 0, total); return ptr; }
     return NULL;
 #endif
     return calloc(nitems, size);
