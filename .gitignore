@@ -15,3 +15,6 @@ firmware/hazard_beacon/.pio/
 # Python
 __pycache__/
 *.pyc
+
+# WiFi and Telegram credentials — never commit these
+firmware/hazard_beacon/src/credentials.h
