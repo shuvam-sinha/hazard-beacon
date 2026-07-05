@@ -1,11 +1,12 @@
 #include <Arduino.h>
 #include "esp_camera.h"
 #include <hazard_beacon_inferencing.h>  // Edge Impulse generated Arduino library (model + SDK)
-#include <WiFi.h>           // ESP32 WiFi driver — handles connecting to a network
-#include <WiFiClientSecure.h> // TLS-capable TCP client — required for HTTPS connections
-#include <HTTPClient.h>     // High-level HTTP library — builds and sends GET/POST requests
-#include <ArduinoJson.h>    // JSON serialisation — builds the {"chat_id":...,"text":...} payload
-#include "credentials.h"    // WiFi SSID/password and Telegram token/chat ID (gitignored)
+// Telegram includes — commented out during test mode
+// #include <WiFi.h>
+// #include <WiFiClientSecure.h>
+// #include <HTTPClient.h>
+// #include <ArduinoJson.h>
+// #include "credentials.h"
 
 // ── Camera pin definitions for ESP32-S3-EYE ──────────────────────────────────
 // The board variant (esp32s3camlcd) defines different pin numbers so we
@@ -50,53 +51,30 @@
 // Shared between loop() and the Edge Impulse get_data callback
 static uint8_t *frame_buf_ptr = nullptr;
 
-// ── Telegram alert cooldown ───────────────────────────────────────────────────
-// millis() returns milliseconds since boot. We compare it against the timestamp
-// of the last alert to enforce a minimum gap between notifications.
-static const uint32_t ALERT_COOLDOWN_MS = 30000; // 30 seconds between alerts
-static uint32_t last_alert_ms = 0;                // timestamp of the last alert sent
+// ── Telegram alert — commented out during test mode ───────────────────────────
+// Uncomment when restoring normal camera mode.
+/*
+static const uint32_t ALERT_COOLDOWN_MS = 30000;
+static uint32_t last_alert_ms = 0;
 
-// ── Send Telegram notification ────────────────────────────────────────────────
 static void sendTelegramAlert(float score) {
-    // Don't attempt if WiFi dropped — avoids a long blocking timeout
     if (WiFi.status() != WL_CONNECTED) return;
-
-    // WiFiClientSecure handles the TLS handshake that HTTPS requires.
-    // setInsecure() skips certificate verification — acceptable on a private
-    // embedded device but would be a security risk in a public-facing server.
     WiFiClientSecure client;
     client.setInsecure();
-
     HTTPClient https;
-
-    // The Telegram Bot API endpoint for sending a message.
-    // Format: https://api.telegram.org/bot<TOKEN>/sendMessage
     String url = String("https://api.telegram.org/bot") + TELEGRAM_BOT_TOKEN + "/sendMessage";
-
-    // Open a TCP+TLS connection to api.telegram.org
     if (!https.begin(client, url)) return;
-
-    // Tell the server the body we're sending is JSON, not a form
     https.addHeader("Content-Type", "application/json");
-
-    // Build the JSON payload Telegram expects:
-    // { "chat_id": "...", "text": "..." }
-    // ArduinoJson serialises this into a compact string automatically.
     JsonDocument doc;
     doc["chat_id"] = TELEGRAM_CHAT_ID;
     doc["text"]    = String("Hazard detected! Confidence: ") + String(score * 100, 0) + "%";
-
     String body;
-    serializeJson(doc, body); // converts the JSON object → String
-
-    // POST sends the request and returns the HTTP status code.
-    // 200 = success, anything else means Telegram rejected it.
+    serializeJson(doc, body);
     int code = https.POST(body);
     Serial.printf("[Telegram] response code: %d\n", code);
-
-    // Always close the connection — HTTPClient holds a socket open otherwise
     https.end();
 }
+*/
 
 // ── Edge Impulse signal callback ──────────────────────────────────────────────
 // Called by the classifier to read pixel values one chunk at a time.
@@ -125,11 +103,9 @@ void setup() {
     Serial.printf("PSRAM total: %u bytes  free: %u bytes\n",
                   ESP.getPsramSize(), ESP.getFreePsram());
 
-    // ── WiFi connection ───────────────────────────────────────────────────────
-    // WiFi.begin() starts the connection process in the background.
-    // The while loop polls every 500ms until the ESP32 gets an IP address
-    // from the router (WL_CONNECTED), or we give up after 15 seconds.
-    // If WiFi fails, the rest of the firmware still runs — alerts just won't send.
+    // ── WiFi connection — commented out during test mode ─────────────────────
+    // Uncomment when restoring normal camera mode.
+    /*
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     Serial.print("Connecting to WiFi");
     uint32_t wifi_start = millis();
@@ -138,11 +114,11 @@ void setup() {
         Serial.print(".");
     }
     if (WiFi.status() == WL_CONNECTED) {
-        // localIP() prints the IP the router assigned to the ESP32 (e.g. 192.168.1.42)
         Serial.printf("\nWiFi connected: %s\n", WiFi.localIP().toString().c_str());
     } else {
         Serial.println("\nWiFi failed — continuing without notifications");
     }
+    */
 
     // ── Camera configuration ──────────────────────────────────────────────────
     camera_config_t config;
@@ -190,9 +166,100 @@ void setup() {
     Serial.println("Camera initialized. Running inference every 2 seconds...");
 }
 
-// ── Main loop ─────────────────────────────────────────────────────────────────
+// ── Main loop (TEST MODE) ─────────────────────────────────────────────────────
+// Receives images over serial from scripts/test_exported_model.py and runs the
+// classifier on them to validate the exported model against known labelled data.
+// To restore normal camera mode, comment this out and uncomment NORMAL MODE below.
 void loop() {
-    // Capture a single frame from the camera into a frame buffer
+    // Buffer that holds one received 96×96 grayscale image (9216 bytes)
+    static uint8_t test_img_buf[EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT];
+
+    const size_t img_size = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+
+    // Repeatedly announce readiness every 2 seconds while idle so the Python
+    // script can connect at any time and still catch the handshake message.
+    static uint32_t last_ready_ms = 0;
+    if (!Serial.available()) {
+        if (millis() - last_ready_ms > 2000) {
+            Serial.println("TEST_MODE_READY");
+            last_ready_ms = millis();
+        }
+        return;
+    }
+
+    // Read the header line sent by the Python script.
+    // Format: TEST_IMAGE:<true_label>:<num_bytes>
+    // e.g.   TEST_IMAGE:hazard_present:9216
+    String header = Serial.readStringUntil('\n');
+    header.trim();
+    if (!header.startsWith("TEST_IMAGE:")) return;
+
+    // The byte count is the last colon-separated field in the header
+    int last_colon = header.lastIndexOf(':');
+    size_t num_bytes = header.substring(last_colon + 1).toInt();
+
+    if (num_bytes != img_size) {
+        Serial.printf("RESULT:error:bad_size_%u\n", num_bytes);
+        return;
+    }
+
+    // Acknowledge the header so Python knows we're ready to receive chunks
+    Serial.println("HEADER_OK");
+
+    // Read image bytes in 64-byte chunks, sending an ACK after each one.
+    // Python waits for the ACK before sending the next chunk, so the ESP32
+    // UART buffer never overflows and no bytes are dropped.
+    const size_t CHUNK = 64;
+    size_t received = 0;
+    while (received < num_bytes) {
+        size_t want = min(CHUNK, num_bytes - received);
+
+        // Block until exactly `want` bytes arrive (up to 5 seconds)
+        size_t got = Serial.readBytes(test_img_buf + received, want);
+        if (got != want) {
+            Serial.printf("RESULT:error:timeout_%u\n", received + got);
+            return;
+        }
+        received += got;
+
+        // Tell Python it can send the next chunk
+        Serial.println("ACK");
+    }
+
+    // Point the global frame_buf_ptr at our received image so the
+    // get_signal_data callback feeds it into the classifier unchanged
+    frame_buf_ptr = test_img_buf;
+
+    signal_t signal;
+    signal.total_length = img_size;
+    signal.get_data     = &get_signal_data;
+
+    ei_impulse_result_t result = { 0 };
+    EI_IMPULSE_ERROR ei_err = run_classifier(&signal, &result, false);
+
+    if (ei_err != EI_IMPULSE_OK) {
+        Serial.printf("RESULT:error:%d\n", ei_err);
+        return;
+    }
+
+    // Find the class with the highest confidence score
+    const char *best_label = "";
+    float best_score = 0.0f;
+    for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        if (result.classification[i].value > best_score) {
+            best_score = result.classification[i].value;
+            best_label = result.classification[i].label;
+        }
+    }
+
+    // Send result back to the Python script — format: RESULT:<label>:<score>
+    Serial.printf("RESULT:%s:%.4f\n", best_label, best_score);
+}
+
+/*
+// ── Main loop (NORMAL CAMERA MODE) ────────────────────────────────────────────
+// Uncomment this block and comment out TEST MODE above to restore live inference.
+void loop() {
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
         Serial.println("ERROR: Frame capture failed");
@@ -200,17 +267,12 @@ void loop() {
         return;
     }
 
-    // Point the global buffer pointer at this frame's pixel data
-    // so the get_signal_data callback can read from it
     frame_buf_ptr = fb->buf;
 
-    // Build the Edge Impulse signal descriptor
-    // total_length = 96*96 = 9216 pixels
     signal_t signal;
     signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
     signal.get_data     = &get_signal_data;
 
-    // Run the ML classifier on the captured frame
     ei_impulse_result_t result = { 0 };
     EI_IMPULSE_ERROR ei_err = run_classifier(&signal, &result, false);
 
@@ -220,7 +282,6 @@ void loop() {
         return;
     }
 
-    // Extract confidence scores for each class from the result
     float hazard_score  = 0.0f;
     float ambient_score = 0.0f;
     for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
@@ -230,31 +291,23 @@ void loop() {
         if (label == "ambient_noise")  ambient_score = value;
     }
 
-    // Trigger LED if hazard confidence exceeds 60% threshold
     bool hazard_detected = hazard_score > 0.6f;
     digitalWrite(LED_PIN, hazard_detected ? HIGH : LOW);
 
-    // Send a Telegram alert every 30 seconds regardless of detection result.
-    // This lets us verify the WiFi + Telegram integration works independently
-    // of the ML model. Once the model is retrained on nighttime IR data and
-    // detection is reliable, change this condition to: hazard_detected && ...
     if (millis() - last_alert_ms > ALERT_COOLDOWN_MS) {
         sendTelegramAlert(hazard_score);
         last_alert_ms = millis();
     }
 
-    // Print result to serial for monitoring
     Serial.printf("[Inference] hazard=%.2f  ambient=%.2f  → %s\n",
         hazard_score, ambient_score,
         hazard_detected ? "HAZARD DETECTED" : "clear");
 
-    // Send raw frame bytes so the laptop can save them as PNGs.
-    // Header line: FRAME_START:<bytes>:<label>:<score>
     const char *label_str = hazard_detected ? "hazard" : "ambient";
     Serial.printf("FRAME_START:%u:%s:%.2f\n", fb->len, label_str,
         hazard_detected ? hazard_score : ambient_score);
     Serial.write(fb->buf, fb->len);
 
-    // Return the frame buffer back to the camera driver
     esp_camera_fb_return(fb);
 }
+*/

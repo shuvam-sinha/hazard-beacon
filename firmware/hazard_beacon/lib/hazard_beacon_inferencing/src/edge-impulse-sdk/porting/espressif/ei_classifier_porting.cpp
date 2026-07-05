@@ -120,7 +120,6 @@ __attribute__((weak)) void *ei_calloc(size_t nitems, size_t size) {
     return calloc(nitems, size);
 }
 
-// heap_caps_free works for both internal RAM and PSRAM pointers
 __attribute__((weak)) void ei_free(void *ptr) {
     heap_caps_free(ptr);
 }

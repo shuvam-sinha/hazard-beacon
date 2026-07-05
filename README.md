@@ -59,7 +59,9 @@ hazard_beacon/
 │   ├── filter_nightowls.py
 │   ├── download_iwildcam.py
 │   ├── augment_dataset.py
-│   └── process_dataset.py
+│   ├── process_dataset.py
+│   ├── test_eim_model.py        # macOS host-side model validation (edge_impulse_linux)
+│   └── test_exported_model.py   # ESP32 serial-based inference test (deprecated)
 └── model/                     # Edge Impulse exports
 ```
 
@@ -116,6 +118,40 @@ iWildCam download hit a Kaggle API rate limit after ~642 images, so the iWildCam
 Exported as **C++ library** (Arduino format). Place the extracted folder in `firmware/hazard_beacon/lib/` as `hazard_beacon_inferencing/`.
 
 The EON compiler path (`EI_CLASSIFIER_COMPILED=1`) is used, not the standard TFLite Micro interpreter path. This means `tflite_eon.h` calls `graph_config->model_init(ei_aligned_calloc)` at runtime, and the compiled model file (`tflite_learn_*_compiled.cpp`) handles its own tensor arena allocation and operator dispatch.
+
+---
+
+## Model Validation (macOS host-side)
+
+After exporting from Edge Impulse, the model was validated on macOS using the `.eim` binary (Edge Impulse Linux SDK). This is a **host-side sanity check only** — the `.eim` is a macOS ARM64 executable and cannot run on the ESP32. The ESP32 uses the C++ library export (`lib/hazard_beacon_inferencing/`).
+
+### How it works
+
+`scripts/test_eim_model.py` loads labelled images from `dataset/processed/`, runs them through the `.eim` model via `ImageImpulseRunner`, and reports per-class accuracy. Images are passed as OpenCV numpy arrays (not file paths) to `runner.get_features_from_image()`.
+
+### Running
+
+```bash
+pip install edge_impulse_linux opencv-python
+python scripts/test_eim_model.py --samples 200
+# --eim flag overrides the default path if your .eim is elsewhere
+```
+
+Default `.eim` path: `~/Downloads/hazard_beacon-mac-arm64-v4-impulse-#1.eim`
+
+### Results (Week 5, model 1043721)
+
+Tested on 200 randomly sampled images (100 per class) from `dataset/processed/`:
+
+| Class | Correct | Accuracy |
+|---|---|---|
+| ambient_noise | 98/100 | 98.0% |
+| hazard_present | 92/100 | 92.0% |
+| **Overall** | **190/200** | **95.0%** |
+
+Edge Impulse's own validation set reported 95.9% (98.5% ambient / 90.9% hazard), so the exported model is behaving as trained.
+
+> **Note:** This test samples from the full dataset including training images, so accuracy may be slightly inflated compared to Edge Impulse's held-out test set figure.
 
 ---
 
