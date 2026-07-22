@@ -46,7 +46,7 @@
 #include "edge-impulse-sdk/classifier/inferencing_engines/engines.h"
 #include "edge-impulse-sdk/classifier/postprocessing/ei_postprocessing_common.h"
 
-const char* ei_classifier_inferencing_categories_1043721_1[] = { "ambient_noise", "hazard_present" };
+const char* ei_classifier_inferencing_categories_1043721_1[] = { "ambient_noise", "hazard_detected" };
 
 ei_dsp_named_axis_t ei_dsp_config_1043721_3_named_axes[] = {
     { .name = "Image", .axis = 0 }
@@ -93,7 +93,7 @@ ei_learning_block_config_tflite_graph_t ei_learning_block_config_1043721_4 = {
     .block_id = 4,
     .output_tensors_indices = ei_output_tensors_indices_1043721_4,
     .output_tensors_size = ei_output_tensors_size_1043721_4,
-    .quantized = 0,
+    .quantized = 1,
     .compiled = 1,
     .graph_config = (void*)&ei_config_graph_1043721_4,
     .dequantize_output = 0,
@@ -113,6 +113,11 @@ const ei_learning_block_t ei_learning_blocks_1043721_1[ei_learning_blocks_104372
     },
 };
 
+ei_fill_result_classification_i8_config_t ei_fill_result_classification_i8_config_1043721_4 = {
+    .zero_point = -128,
+    .scale = 0.00390625
+};
+
 const size_t ei_postprocessing_blocks_1043721_1_size = 1;
 const ei_postprocessing_block_t ei_postprocessing_blocks_1043721_1[ei_postprocessing_blocks_1043721_1_size] = {
     {
@@ -120,9 +125,9 @@ const ei_postprocessing_block_t ei_postprocessing_blocks_1043721_1[ei_postproces
         .type = EI_CLASSIFIER_MODE_CLASSIFICATION,
         .init_fn = NULL,
         .deinit_fn = NULL,
-        .postprocess_fn = &process_classification_f32,
+        .postprocess_fn = &process_classification_i8,
         .display_fn = NULL,
-        .config = NULL,
+        .config = (void*)&ei_fill_result_classification_i8_config_1043721_4,
         .input_block_id = 4
     },
 };
@@ -137,7 +142,7 @@ const ei_impulse_t impulse_1043721_1 = {
     .project_name = "hazard_beacon",
     .impulse_id = 1,
     .impulse_name = "Impulse #1",
-    .deploy_version = 1,
+    .deploy_version = 7,
 
     .nn_input_frame_size = 27648,
     .raw_sample_count = 9216,

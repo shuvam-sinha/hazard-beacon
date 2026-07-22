@@ -12,6 +12,9 @@ dataset/raw/exdark/
 # PlatformIO build output
 firmware/hazard_beacon/.pio/
 
+# Debug frame dumps from scripts/capture_classified_frames.py
+debug_captures/
+
 # Python
 __pycache__/
 *.pyc

@@ -25,7 +25,7 @@ from pathlib import Path
 # ── Config ────────────────────────────────────────────────────────────────────
 
 PROCESSED_DIR   = Path("~/Documents/hazard_beacon/dataset/processed").expanduser()
-CLASS_FOLDERS   = ["hazard_present", "ambient_noise"]
+CLASS_FOLDERS   = ["hazard_present2", "ambient_noise2"]
 AUGMENTS_PER_IMAGE = 5       # how many augmented copies to generate per original
 TARGET_SIZE        = (96, 96)
 
@@ -45,30 +45,12 @@ def brightness_jitter(img):
     return out
 
 
-def gaussian_noise(img):
-    noise = np.random.normal(0, 8, img.shape).astype(np.float32)
-    out = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-    return out
-
-
-def random_crop(img):
-    h, w = img.shape
-    max_offset = 8  # pixels to crop from each side
-    top    = np.random.randint(0, max_offset)
-    left   = np.random.randint(0, max_offset)
-    bottom = np.random.randint(0, max_offset)
-    right  = np.random.randint(0, max_offset)
-    cropped = img[top:h-bottom-1, left:w-right-1]
-    return cv2.resize(cropped, TARGET_SIZE, interpolation=cv2.INTER_AREA)
-
 
 def augment(img):
     """Apply a random combination of transformations to one image."""
     if np.random.rand() > 0.5:
         img = horizontal_flip(img)
     img = brightness_jitter(img)
-    img = gaussian_noise(img)
-    img = random_crop(img)
     return img
 
 

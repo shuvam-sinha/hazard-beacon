@@ -95,6 +95,42 @@ __attribute__((weak)) void ei_printf_float(float f) {
     ei_printf("%f", f);
 }
 
+// we use alligned alloc instead of regular malloc
+// due to https://github.com/espressif/esp-nn/issues/7
+// --- ORIGINAL (pre Week-5 patch) ei_malloc/ei_calloc/ei_free, kept for rollback ---
+// __attribute__((weak)) void *ei_malloc(size_t size) {
+// #if defined(CONFIG_IDF_TARGET_ESP32S3)
+// #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+//     return heap_caps_aligned_alloc(16, size, MALLOC_CAP_DEFAULT);
+// #else
+//     return aligned_alloc(16, size);
+// #endif
+// #endif
+//     return malloc(size);
+// }
+//
+// __attribute__((weak)) void *ei_calloc(size_t nitems, size_t size) {
+// #if defined(CONFIG_IDF_TARGET_ESP32S3)
+// #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+//     return heap_caps_calloc(nitems, size, MALLOC_CAP_DEFAULT);
+// #else
+//     void *p;
+//     p = aligned_alloc(16, nitems * size);
+//     if (p == nullptr)
+//         return p;
+//
+//     memset(p, '\0', nitems * size);
+//     return p;
+// #endif
+// #endif
+//     return calloc(nitems, size);
+// }
+//
+// __attribute__((weak)) void ei_free(void *ptr) {
+//     free(ptr);
+// }
+// --- END ORIGINAL ---
+
 // Allocate from PSRAM first (8MB available on ESP32-S3-EYE) so the
 // tensor arena fits. Falls back to internal RAM if PSRAM is full.
 // 16-byte alignment is required for CMSIS-NN SIMD operations.

@@ -371,6 +371,9 @@ void ei_free(void *ptr);
 #endif
 
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
+// Original value was 30; raised to 100 (Week 5) — this model needs >30
+// CMSIS-NN scratch buffers. Uncomment below and remove the 100 line to roll back.
+// #define EI_MAX_OVERFLOW_BUFFER_COUNT	30
 #define EI_MAX_OVERFLOW_BUFFER_COUNT	100
 #endif
 

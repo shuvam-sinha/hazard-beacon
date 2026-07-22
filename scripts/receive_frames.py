@@ -12,6 +12,7 @@ Requirements:
 """
 
 import serial          # Handles USB serial communication with the ESP32
+import serial.tools.list_ports  # Used to find which port the ESP32 showed up on
 import numpy as np     # Used to reshape raw bytes into a 2D image array
 import cv2             # OpenCV — used to save the image array as a PNG file
 import os              # Used to create output directories and build file paths
@@ -19,15 +20,33 @@ import time            # Used to generate unique timestamps for filenames
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-SERIAL_PORT = "/dev/cu.usbmodem1101"   # The port your ESP32 is connected to on Mac
 BAUD_RATE   = 115200                   # Must match Serial.begin() in your firmware
 IMG_WIDTH   = 96                       # Frame width in pixels — must match FRAMESIZE_96X96
 IMG_HEIGHT  = 96                       # Frame height in pixels — must match FRAMESIZE_96X96
 
 CLASS_DIRS = {
-    "1": os.path.expanduser("~/Documents/hazard_beacon/dataset/processed/hazard_present"),
-    "2": os.path.expanduser("~/Documents/hazard_beacon/dataset/processed/ambient_noise"),
+    "1": os.path.expanduser("~/Documents/hazard_beacon/dataset/processed/hazard_present2"),
+    "2": os.path.expanduser("~/Documents/hazard_beacon/dataset/processed/ambient_noise2"),
 }
+
+# ── Find the ESP32's serial port ──────────────────────────────────────────────
+# macOS names the port something like /dev/cu.usbmodem101, but the number can
+# change between reconnects, so we look it up instead of hardcoding it.
+
+
+def find_serial_port():
+    for port in serial.tools.list_ports.comports():
+        if "usbmodem" in port.device or "usbserial" in port.device:
+            return port.device
+    return None
+
+
+SERIAL_PORT = find_serial_port()
+
+if SERIAL_PORT is None:
+    print("ERROR: No ESP32 serial port found.")
+    print("Check that the USB cable is connected and the board is powered on.")
+    raise SystemExit(1)
 
 # ── Session prompt ────────────────────────────────────────────────────────────
 
