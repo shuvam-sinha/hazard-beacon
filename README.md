@@ -1,8 +1,56 @@
 # Hazard Beacon
 
-Nighttime wildlife and person detection system running on an ESP32-S3-EYE camera module. Uses an IR illuminator to light the scene, captures 96×96 grayscale frames, and runs a MobileNetV2 0.35 int8 classifier on-device via Edge Impulse's EON compiler. A yellow LED lights when the hazard confidence score exceeds 60%.
+A self-contained smart security camera built on an ESP32-S3-EYE. It watches a fixed scene, runs a MobileNetV2 image classifier **entirely on the microcontroller** — no cloud inference, no streaming — and when a person lingers in view it pushes the frame to a local web dashboard.
 
-Binary classification: **hazard_present** vs **ambient_noise**.
+Binary classification: **hazard_detected** (a person is present) vs **ambient_noise** (empty scene).
+
+### Highlights
+
+- **On-device deep learning.** MobileNetV2 0.35 runs on the MCU itself, int8-quantized through Edge Impulse's EON compiler — ~1.5 s per inference in 249 KB of RAM.
+- **A real modeling insight.** Camera exposure is locked in firmware to stop the model from cheating on background brightness (a spurious correlation that auto-exposure introduces). See [Design](#design-fixed-scene-locked-exposure).
+- **Low-level systems debugging.** Traced a PSRAM heap-corruption crash down to 16-byte SIMD alignment inside the CMSIS-NN allocator and patched the Edge Impulse SDK. See [Debugging log](#debugging-log--the-crash-cascade).
+- **End-to-end IoT pipeline.** Device → WiFi → Flask backend → live browser dashboard, triggered only on *sustained* detection so a single flicker never fires.
+
+---
+
+## Architecture
+
+```
+┌──────────────────┐                 ┌───────────────────────┐              ┌──────────────┐
+│   ESP32-S3-EYE   │                 │   Flask server (Mac)  │              │   Browser    │
+│                  │  HTTP POST      │                       │   HTTP GET   │              │
+│  capture 96×96   │  raw frame      │  /upload → save PNG,  │              │  live gallery│
+│  MobileNetV2 ──► │ ───────────────►│   timestamp + score   │ ────────────►│  of detections│
+│  sustained?      │  (on trigger)   │  /       → gallery    │              │              │
+└──────────────────┘                 └───────────────────────┘              └──────────────┘
+   inference on-device            fires only after ~10 s of continuous presence
+```
+
+---
+
+## Design: fixed scene, locked exposure
+
+The camera watches one unchanging scene, so "empty" looks nearly identical frame to frame and anything that differs is what matters. That makes the problem tractable on a microcontroller in a way general-purpose object detection is not — the model only has to separate *this* background from *this* background with a person in it.
+
+That framing hides a subtle trap. With auto-exposure enabled and a bright background, a person entering the frame lowers average brightness; the sensor compensates by raising exposure, which brightens the background. Now **background brightness is correlated with the class label**, and the model happily learns that shortcut instead of learning what a person looks like. It scores beautifully in training and fails in the real world, because the signal was an artifact of the sensor, not the scene.
+
+The fix is to lock exposure, gain, and white balance so the background renders identically every frame:
+
+```cpp
+sensor_t *s = esp_camera_sensor_get();
+if (s) {
+    const int AEC_VALUE = 300;      // fixed exposure — tune once to the scene
+    const int AGC_GAIN  = 0;        // fixed gain (0 = lowest)
+    s->set_exposure_ctrl(s, 0);     // disable auto exposure
+    s->set_aec2(s, 0);
+    s->set_aec_value(s, AEC_VALUE);
+    s->set_gain_ctrl(s, 0);         // disable auto gain
+    s->set_agc_gain(s, AGC_GAIN);
+    s->set_whitebal(s, 0);          // disable auto white balance
+}
+```
+
+Two rules follow: these calls must run **after** `esp_camera_init()` (settings applied earlier are discarded), and the **same `AEC_VALUE` is used for both data collection and deployment** — otherwise every deployed frame is out of distribution.
 
 ---
 
@@ -10,13 +58,13 @@ Binary classification: **hazard_present** vs **ambient_noise**.
 
 | Component | Detail |
 |---|---|
-| MCU + Camera | ESP32-S3-EYE (OV2640, 8MB OPI PSRAM, 8MB Flash) |
-| IR illuminator | Auto-activates in darkness |
-| Alert LED | GPIO 21, yellow, HIGH on hazard |
+| MCU + Camera | ESP32-S3-EYE (OV2640, 8 MB OPI PSRAM, 8 MB Flash) |
 | Framework | PlatformIO + Arduino |
-| Board config | `esp32s3camlcd`, `qio_opi` memory type, 8MB partition table |
+| Board config | `esp32s3camlcd`, `qio_opi` memory type, 8 MB partition table |
 
-Camera pins (OV2640 on ESP32-S3-EYE — these differ from the board variant defaults and must be overridden):
+The board is powered and programmed over USB; no external components are attached.
+
+Camera pins (OV2640 on ESP32-S3-EYE — these differ from the board-variant defaults and must be overridden):
 
 ```
 XCLK=15  SIOD=4   SIOC=5
@@ -28,130 +76,99 @@ PWDN=-1  RESET=-1
 
 ---
 
-## Repository Structure
+## Repository structure
 
 ```
 hazard_beacon/
 ├── dataset/
 │   ├── raw/
-│   │   ├── test_captures/     # ESP32 frames captured for pipeline testing
-│   │   ├── iwildcam/          # iWildCam 2020 annotations JSON
-│   │   ├── nightowls/         # NightOwls annotations
-│   │   └── wellington/        # Wellington Camera Traps CSV
-│   ├── processed/
-│   │   ├── hazard_present/    # ~2,178 images (96×96 grayscale PNG)
-│   │   ├── ambient_noise/     # ~2,178 images (96×96 grayscale PNG)
-│   │   └── hazard_review/     # Frames awaiting manual review
-│   └── processed_backup/      # Backup before augmentation
+│   │   └── test_captures/         # raw ESP32 frames kept for reference
+│   └── processed/
+│       ├── hazard_present2/       # 465 device captures — person in frame
+│       └── ambient_noise2/        # 485 device captures — empty scene
 ├── firmware/
 │   └── hazard_beacon/
-│       ├── src/main.cpp
 │       ├── platformio.ini
+│       ├── src/
+│       │   ├── main.cpp           # camera, inference loop, sustained detection, upload
+│       │   ├── test_image.h       # generated by image_to_header.py
+│       │   └── credentials.h      # WiFi creds + SERVER_URL (gitignored)
 │       └── lib/
-│           └── hazard_beacon_inferencing/   # Edge Impulse exported C++ library
+│           └── hazard_beacon_inferencing/   # Edge Impulse C++ export (patched)
 │               └── src/
-│                   ├── tflite-model/        # EON-compiled model
-│                   └── edge-impulse-sdk/    # EI SDK (patched — see below)
-├── scripts/
-│   ├── receive_frames.py
-│   ├── filter_wellington.py
-│   ├── filter_iwildcam.py
-│   ├── filter_nightowls.py
-│   ├── download_iwildcam.py
-│   ├── augment_dataset.py
-│   ├── process_dataset.py
-│   ├── test_eim_model.py        # macOS host-side model validation (edge_impulse_linux)
-│   └── test_exported_model.py   # ESP32 serial-based inference test (deprecated)
-└── model/                     # Edge Impulse exports
+│                   ├── tflite-model/         # EON-compiled model
+│                   └── edge-impulse-sdk/     # EI SDK — see SDK Patches
+├── server/
+│   ├── app.py                     # Flask backend + detection gallery
+│   ├── requirements.txt
+│   └── captures/                  # saved detection PNGs (gitignored)
+└── scripts/
+    ├── receive_frames.py             # collect labelled training frames from the device
+    ├── capture_classified_frames.py  # save frames tagged with the model's decision
+    ├── process_dataset.py            # normalise images to 96×96 grayscale PNG
+    ├── augment_dataset.py            # offline augmentation (prefer EI's built-in)
+    ├── image_to_header.py            # PNG → test_image.h for on-device test mode
+    ├── test_eim_model.py             # host-side .eim smoke test on macOS
+    └── test_exported_model.py        # serial-driven on-device inference test
 ```
 
 ---
 
-## Dataset Pipeline
+## Dataset
 
-### Step 1 — Capture frames from device
+The model is trained **entirely on frames captured from the device itself**, in the same scene and at the same locked exposure it runs in. Because the scene is fixed, in-domain data from the real camera is worth far more than a larger volume of generic images.
 
-`scripts/receive_frames.py` opens the serial port, reads frames sent by the ESP32 framing protocol (`FRAME_START:<len>\n` followed by raw bytes), prompts the user to label each frame (1 = hazard_present, 2 = ambient_noise), and saves them into `dataset/processed/`.
+| Class | Images | Scene |
+|---|---|---|
+| `ambient_noise2/` | 485 | Fixed background, empty |
+| `hazard_present2/` | 465 | Same background, a person in frame |
 
-### Step 2 — Filter external nighttime datasets
+### Collecting frames
 
-Three external sources were filtered down to nighttime-only images:
+`scripts/receive_frames.py` reads the device's serial stream, parses the framing protocol, and writes each frame into the class folder you choose:
 
-- **Wellington Camera Traps** — `filter_wellington.py` reads the CSV and filters by time-of-day column
-- **iWildCam 2020** — `filter_iwildcam.py` reads `iwildcam2020_train_annotations.json` and keeps images captured between 19:00–06:00
-- **NightOwls** — `filter_nightowls.py` reads NightOwls annotations (dataset is entirely nighttime, so this script is mainly for format conversion)
+```bash
+python3 scripts/receive_frames.py     # prompts: 1 = hazard, 2 = ambient
+```
 
-iWildCam download hit a Kaggle API rate limit after ~642 images, so the iWildCam contribution to the dataset is partial.
+It auto-detects the serial port (macOS renumbers `/dev/cu.usbmodem*` between reconnects) and requires `DUMP_FRAMES 1` in the firmware (see [Frame streaming](#frame-streaming)).
 
-### Step 3 — Process to uniform format
+### Augmentation
 
-`scripts/process_dataset.py` converts all images in `dataset/processed/` to 96×96 grayscale PNG in-place. This matches the Edge Impulse impulse input size.
-
-### Step 4 — Augment ESP32 captures
-
-`scripts/augment_dataset.py` applies 5× augmentation to ESP32-captured frames only (not external dataset images, which are already varied). Augmentations: ±20% brightness, horizontal flip, Gaussian noise, random crop.
-
-### Dataset status (as of Week 5)
-
-- **hazard_present**: ~2,178 images
-- **ambient_noise**: ~2,178 images (balanced)
-
-> **Important caveat:** The current dataset is daytime captures. The deployment environment is nighttime IR-illuminated. This dataset validates the pipeline only — accuracy will be poor until a HIL rig is used to collect real nighttime IR data and the model is retrained (planned Week 6).
+`scripts/augment_dataset.py` can generate offline copies (horizontal flip + brightness jitter), but Edge Impulse's built-in augmentation is preferred: it augments training batches in memory, never touches the validation set, and re-randomises each epoch — which avoids train/test leakage from near-duplicate copies landing on both sides of the split.
 
 ---
 
-## Model Training (Edge Impulse)
+## Model (Edge Impulse)
 
-**Project:** hazard_beacon (Edge Impulse Studio)  
-**Target:** Espressif ESP-EYE  
-**Upload:** 4,356 items, 80/20 train/test split  
+**Target:** Espressif ESP-EYE
 
 ### Impulse configuration
 
-- Input: 96×96 Image block, resize mode: **Squash** (not fit/crop — Squash avoids padding artifacts)
-- Processing: Image block (grayscale)
-- Learning: Classification (MobileNetV2 0.35, 60 epochs, lr=0.001)
-- Quantization: int8 post-training quantization
+- **Input:** 96×96 image, resize mode **Squash** (avoids the padding artifacts fit/crop introduce)
+- **Processing:** Image block, RGB — 27,648 features (96×96×3)
+- **Learning:** Transfer learning, MobileNetV2 0.35, 20 cycles, lr = 0.0005, augmentation enabled
+- **Output classes:** `ambient_noise`, `hazard_detected`
+- **Quantization:** int8 post-training
 
-### Export
+The DSP block is configured for **RGB** even though the camera is grayscale; the firmware packs each grey byte into all three channels — see [Signal callback](#signal-callback).
 
-Exported as **C++ library** (Arduino format). Place the extracted folder in `firmware/hazard_beacon/lib/` as `hazard_beacon_inferencing/`.
+### Results
 
-The EON compiler path (`EI_CLASSIFIER_COMPILED=1`) is used, not the standard TFLite Micro interpreter path. This means `tflite_eon.h` calls `graph_config->model_init(ei_aligned_calloc)` at runtime, and the compiled model file (`tflite_learn_*_compiled.cpp`) handles its own tensor arena allocation and operator dispatch.
+Edge Impulse validation set. The **int8** model is what runs on the device; float32 is included for reference.
 
----
+| Model | Accuracy | `ambient_noise` recall | `hazard_detected` recall | Weighted F1 |
+|---|---|---|---|---|
+| **int8 (deployed)** | **97.8%** | 100% | 95.6% | 0.98 |
+| float32 (reference) | 99.8% | 100% | 99.6% | 1.00 |
 
-## Model Validation (macOS host-side)
+On-device performance (int8, ESP32-S3 @ 240 MHz, Edge Impulse estimate):
 
-After exporting from Edge Impulse, the model was validated on macOS using the `.eim` binary (Edge Impulse Linux SDK). This is a **host-side sanity check only** — the `.eim` is a macOS ARM64 executable and cannot run on the ESP32. The ESP32 uses the C++ library export (`lib/hazard_beacon_inferencing/`).
-
-### How it works
-
-`scripts/test_eim_model.py` loads labelled images from `dataset/processed/`, runs them through the `.eim` model via `ImageImpulseRunner`, and reports per-class accuracy. Images are passed as OpenCV numpy arrays (not file paths) to `runner.get_features_from_image()`.
-
-### Running
-
-```bash
-pip install edge_impulse_linux opencv-python
-python scripts/test_eim_model.py --samples 200
-# --eim flag overrides the default path if your .eim is elsewhere
-```
-
-Default `.eim` path: `~/Downloads/hazard_beacon-mac-arm64-v4-impulse-#1.eim`
-
-### Results (Week 5, model 1043721)
-
-Tested on 200 randomly sampled images (100 per class) from `dataset/processed/`:
-
-| Class | Correct | Accuracy |
-|---|---|---|
-| ambient_noise | 98/100 | 98.0% |
-| hazard_present | 92/100 | 92.0% |
-| **Overall** | **190/200** | **95.0%** |
-
-Edge Impulse's own validation set reported 95.9% (98.5% ambient / 90.9% hazard), so the exported model is behaving as trained.
-
-> **Note:** This test samples from the full dataset including training images, so accuracy may be slightly inflated compared to Edge Impulse's held-out test set figure.
+| Metric | Value |
+|---|---|
+| Inference latency | ~1.5 s |
+| Peak RAM | 248.7 KB |
+| Flash | 531.9 KB |
 
 ---
 
@@ -170,70 +187,114 @@ board_upload.flash_size = 8MB
 board_build.partitions = default_8MB.csv
 lib_deps =
     espressif/esp32-camera
+    bblanchon/ArduinoJson@^7.0.0
 build_flags =
     -DBOARD_HAS_PSRAM
     -DARDUINO_USB_MODE=1
     -DARDUINO_USB_CDC_ON_BOOT=1
-    -DEI_MAX_OVERFLOW_BUFFER_COUNT=30   # redundant (porting header overrides to 100), harmless
 ```
 
-### Inference loop (main.cpp)
+### Inference loop
 
-1. `esp_camera_fb_get()` — capture frame into DMA buffer
-2. Build `signal_t` with `get_signal_data` callback that normalises `uint8 → float [0,1]`
-3. `run_classifier(&signal, &result, false)` — runs EON-compiled MobileNetV2
-4. `esp_camera_fb_return(fb)` — release frame buffer immediately after inference
-5. Parse `result.classification[]` for `hazard_present` and `ambient_noise` scores
-6. `digitalWrite(LED_PIN, hazard_score > 0.6f ? HIGH : LOW)`
-7. Print `[Inference] hazard=X.XX  ambient=X.XX  → clear/HAZARD DETECTED`
-8. `delay(2000)`
+1. `esp_camera_fb_get()` — capture a frame into a DMA buffer
+2. Point `frame_buf_ptr` at the pixel data
+3. Build `signal_t` with the `get_signal_data` callback
+4. `run_classifier_init()`, then `esp_task_wdt_reset()` to feed the watchdog before the multi-second inference call
+5. `run_classifier()` — EON-compiled MobileNetV2
+6. Read `hazard_detected` / `ambient_noise` scores and apply the 0.6 threshold
+7. Update the sustained-detection counter and upload on trigger (below)
+8. `esp_camera_fb_return(fb)` — release the buffer
 
-### Low-light sensor tuning
+### Sustained detection
 
-Commented out in main.cpp for daytime testing. Uncomment when deploying with IR illuminator:
+The core of the trigger logic: only report when a hazard *persists*, so a single misclassified frame never fires an upload, and a person standing in view doesn't spam the server.
 
 ```cpp
-sensor_t *s = esp_camera_sensor_get();
-s->set_gainceiling(s, GAINCEILING_16X);
-s->set_exposure_ctrl(s, 1);
-s->set_gain_ctrl(s, 1);
-s->set_aec2(s, 1);
-s->set_bpc(s, 1);
-s->set_wpc(s, 1);
+static int  hazard_streak    = 0;
+static bool episode_reported = false;
+if (hazard_detected) {
+    hazard_streak++;
+    if (hazard_streak >= SUSTAINED_FRAMES && !episode_reported) {
+        uploadHazardFrame(fb->buf, fb->len, hazard_score);   // POST raw frame + score
+        episode_reported = true;                             // once per episode
+    }
+} else {
+    hazard_streak    = 0;
+    episode_reported = false;   // scene cleared — next episode may report again
+}
 ```
 
-### Serial monitoring
+At ~2 s per inference, `SUSTAINED_FRAMES = 5` means roughly 10 seconds of continuous presence before a detection is sent. The upload uses a short HTTP timeout, so an unreachable server can't stall the loop or trip the watchdog — inference simply continues.
 
-```
-~/.platformio/penv/bin/platformio device monitor --baud 115200 --project-dir ~/Documents/hazard_beacon/firmware/hazard_beacon
+### Class label
+
+The model's positive class is **`hazard_detected`**, matched by exact string:
+
+```cpp
+if (strcmp(label, "hazard_detected") == 0) hazard_score  = value;
+if (strcmp(label, "ambient_noise")   == 0) ambient_score = value;
 ```
 
-Expected output:
+If a retrain assigns a different class name, this comparison silently fails and every frame reads as clear with no error anywhere. **Verify the class names on the Edge Impulse deployment page against these strings after every retrain.**
+
+### Signal callback
+
+Edge Impulse pulls pixels through a callback. Because the DSP block is RGB, each grayscale byte is packed into all three channels:
+
+```cpp
+static int get_signal_data(size_t offset, size_t length, float *out_ptr) {
+    for (size_t i = 0; i < length; i++) {
+        uint8_t gray = frame_buf_ptr[offset + i];
+        out_ptr[i] = (float)((gray << 16) | (gray << 8) | gray);   // 0xRRGGBB
+    }
+    return EIDSP_OK;
+}
 ```
-=== Hazard Beacon - Inference Mode ===
-PSRAM total: 8386279 bytes  free: 8386275 bytes
-Camera initialized. Running inference every 2 seconds...
-[Inference] hazard=0.12  ambient=0.88  → clear
+
+### Frame streaming
+
+A compile-time flag controls whether each classified frame is streamed over serial for the capture scripts:
+
+```cpp
+#define DUMP_FRAMES    1
 ```
+
+At `1`, the firmware emits `FRAME_START:<len>:<decision>:<hazard>:<ambient>` followed by the raw pixel bytes — required by `receive_frames.py` and `capture_classified_frames.py`. At `0`, serial is clean text only and the capture scripts receive nothing. (At `1`, a plain serial monitor renders the pixel bytes as garbled text; that's expected — read the stream through one of the scripts.)
 
 ---
 
-## SDK Patches (DO NOT REVERT)
+## Web dashboard
 
-Two files in the Edge Impulse library have been patched. These patches are required for the model to run on ESP32-S3 and will need to be re-applied if you update the library from Edge Impulse.
+`server/app.py` is a small Flask app that turns detections into a live web page.
 
-### Patch 1 — PSRAM allocator alignment fix
+```bash
+cd server
+pip install -r requirements.txt
+python app.py                       # serves on port 5001
+```
+
+- **`POST /upload?score=<0..1>`** — receives the raw 9,216 grayscale bytes, wraps them into a PNG with Pillow, and saves it timestamped (the device has no clock, so the server timestamps on arrival).
+- **`GET /`** — a responsive gallery of every detection, newest first, each labelled with time and confidence, auto-refreshing every 10 seconds.
+
+The device targets `SERVER_URL` (set in `credentials.h`) — the Mac's LAN address, e.g. `http://10.0.0.192:5001`. The server binds to `0.0.0.0` so the ESP32 can reach it across the network. (Port 5001, not 5000 — macOS reserves 5000 for AirPlay Receiver.)
+
+---
+
+## SDK patches (DO NOT REVERT)
+
+Two files in the Edge Impulse library are patched; both are required for the model to run on ESP32-S3. A fresh export overwrites them, so they must be reapplied after any library update.
+
+### Patch 1 — PSRAM allocator alignment
 
 **File:** `lib/hazard_beacon_inferencing/src/edge-impulse-sdk/porting/espressif/ei_classifier_porting.cpp`
 
-**Problem:** The default `ei_malloc` and `ei_calloc` used `heap_caps_malloc`/`heap_caps_calloc` with `MALLOC_CAP_SPIRAM`, which returns 8-byte aligned memory. CMSIS-NN SIMD operations require 16-byte alignment. Additionally, the EON compiled model's `AllocatePersistentBufferImpl` calculates alignment padding when checking whether a scratch buffer fits in the tensor arena, but when it overflows to `ei_calloc(bytes, 1)`, it only allocates exactly `bytes` — not `bytes + padding`. CMSIS-NN then writes up to the next 16-byte boundary, stomping the ESP-IDF heap poisoning canary and triggering:
+The default `ei_malloc`/`ei_calloc` return 8-byte aligned memory, but CMSIS-NN SIMD operations require 16-byte alignment. Worse, the EON model accounts for alignment padding when checking whether a scratch buffer fits the tensor arena, but its overflow path calls `ei_calloc(bytes, 1)` — no padding. CMSIS-NN then writes up to the next 16-byte boundary, past the end of the allocation, corrupting the ESP-IDF heap canary:
 
 ```
 CORRUPT HEAP: Bad tail at 0x3da25537. Expected 0xbaad5678 got 0x4dc7cf51
-assert failed: multi_heap_free multi_heap_poisoning.c:259 (head != NULL)
 ```
 
-**Fix:** Use `heap_caps_aligned_alloc(16, rounded_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)` where `rounded_size = (requested + 15) & ~15`. This guarantees both pointer alignment and sufficient allocation size.
+**Fix:** allocate from PSRAM with explicit 16-byte alignment and round every request up to a 16-byte multiple.
 
 ```cpp
 __attribute__((weak)) void *ei_malloc(size_t size) {
@@ -245,36 +306,15 @@ __attribute__((weak)) void *ei_malloc(size_t size) {
 #endif
     return malloc(size);
 }
-
-__attribute__((weak)) void *ei_calloc(size_t nitems, size_t size) {
-#if defined(CONFIG_IDF_TARGET_ESP32S3)
-    size_t total = ((nitems * size) + 15) & ~15u;
-    void *ptr = heap_caps_aligned_alloc(16, total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (ptr) { memset(ptr, 0, total); return ptr; }
-    ptr = heap_caps_aligned_alloc(16, total, MALLOC_CAP_DEFAULT);
-    if (ptr) { memset(ptr, 0, total); return ptr; }
-    return NULL;
-#endif
-    return calloc(nitems, size);
-}
-
-__attribute__((weak)) void ei_free(void *ptr) {
-    heap_caps_free(ptr);  // works for both internal RAM and PSRAM pointers
-}
 ```
+
+`ei_calloc` applies the same rounding, and `ei_free` uses `heap_caps_free` so it works for both internal RAM and PSRAM pointers.
 
 ### Patch 2 — Overflow buffer count
 
 **File:** `lib/hazard_beacon_inferencing/src/edge-impulse-sdk/porting/ei_classifier_porting.h`
 
-**Problem:** MobileNetV2 0.35 with CMSIS-NN generates more scratch buffers than fit in the 246KB tensor arena. When these overflow to `ei_calloc`, they are tracked in a static array of size `EI_MAX_OVERFLOW_BUFFER_COUNT`. The default for ESP32-S3 was 30, which was not enough, causing:
-
-```
-ERR: Failed to allocate persistent buffer of size N, does not fit in tensor arena
-and reached EI_MAX_OVERFLOW_BUFFER_COUNT
-```
-
-**Fix:** Raise `EI_MAX_OVERFLOW_BUFFER_COUNT` to 100 for ESP32-S3. This is the **authoritative** definition location — the compiled model file has a `#ifndef` fallback that is overridden by this header.
+MobileNetV2 0.35 with CMSIS-NN generates more scratch buffers than fit the tensor arena. Overflow buffers are tracked in a static array sized by `EI_MAX_OVERFLOW_BUFFER_COUNT`, whose ESP32-S3 default of 30 is too small. Raising it to 100 fixes it — and this header is the **authoritative** definition, overriding both the compiled model's fallback and any build flag.
 
 ```c
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
@@ -282,122 +322,32 @@ and reached EI_MAX_OVERFLOW_BUFFER_COUNT
 #endif
 ```
 
-> **Note on porting layer selection:** When `CONFIG_IDF_TARGET_ESP32S3` is defined (which PlatformIO sets automatically via the board target), `ei_classifier_porting.h` forces `EI_PORTING_ESPRESSIF=1` and `EI_PORTING_ARDUINO=0`, even though the framework is Arduino. This means the Espressif porting layer (`porting/espressif/ei_classifier_porting.cpp`) is the active allocator, not the Arduino one. Any allocator patches must go in the Espressif file.
+> When `CONFIG_IDF_TARGET_ESP32S3` is defined, the SDK forces the **Espressif** porting layer active even though the framework is Arduino — so allocator patches must go in the Espressif file, not the Arduino one.
 
 ---
 
-## Debugging Log — Week 5 Crash Cascade
+## Debugging log — the crash cascade
 
-This section records every crash encountered getting the EON model running, in the order they appeared.
+The sequence of crashes hit while getting the EON model running on-device, kept because the failure modes are non-obvious and recur after library updates.
 
-### Crash 1 — `extern "C"` linkage conflict (compile error)
+**Crash 1 — linkage conflict (compile error).** Overriding the allocators in `main.cpp` inside `extern "C"` blocks conflicted with their C++ linkage in the porting header.
 
-**Symptom:** Compiler error about conflicting C/C++ linkage on `ei_malloc`, `ei_calloc`, `ei_free`.
+**Crash 2 — Core 0 panic before `setup()`.** Defining the allocators in `main.cpp` won weak-symbol resolution, so they ran during Core 0 init — before PSRAM was up. Fix: patch the Espressif porting layer instead, the intended override point.
 
-**Cause:** Initial attempt was to override the allocators in `main.cpp` using `extern "C"` blocks, but the functions are declared with C++ linkage in the porting header.
+**Crash 3 — overflow buffer count exceeded.** Scratch buffers overflowed a tracking array capped at 30. The porting header defines the cap unconditionally for ESP32-S3, overriding the build flag; raised it to 100 (Patch 2).
 
-**Fix:** Removed `extern "C"` wrappers from `main.cpp`. Attempted plain C++ overrides instead (led to next crash).
-
----
-
-### Crash 2 — Core 0 panic before `setup()` ran
-
-**Symptom:**
-```
-Guru Meditation Error: Core 0 panic'd (LoadProhibited)
-EXCVADDR: 0x00000000
-```
-Device rebooted before any serial output from `setup()`.
-
-**Cause:** Defining `ei_malloc`/`ei_calloc`/`ei_free` in `main.cpp` conflicted with the Espressif porting layer's initialization, which runs on Core 0 before `setup()`. The weak-symbol overrides in `main.cpp` were being selected by the linker but called before the PSRAM was initialised.
-
-**Fix:** Removed all allocator overrides from `main.cpp`. Instead, patched the Espressif porting layer directly (`porting/espressif/ei_classifier_porting.cpp`), which is the correct and intentional override point.
+**Crash 4 — heap corruption.** Camera initialised fine; the crash landed on the first `run_classifier()`. Two compounding causes — 8-byte-aligned PSRAM handed to 16-byte SIMD code, and an overflow allocation short by exactly the alignment padding. The corrupted address sat in the PSRAM range (`0x3D000000–0x3DFFFFFF`), confirming a PSRAM allocation. Fixed by Patch 1.
 
 ---
 
-### Crash 3 — Overflow buffer count exceeded
-
-**Symptom:**
-```
-ERR: Failed to allocate persistent buffer of size 692224, does not fit in tensor arena
-and reached EI_MAX_OVERFLOW_BUFFER_COUNT
-Core 1 panic'd (LoadProhibited)
-```
-
-**Cause:** MobileNetV2 0.35 with CMSIS-NN requires more scratch buffers than fit in the 246KB tensor arena. These overflow to heap via `ei_calloc`. The overflow tracking array was capped at 10 (compiled model default) then 30 (build flag), neither of which was sufficient.
-
-**Investigation:** Discovered that `ei_classifier_porting.h` defines `EI_MAX_OVERFLOW_BUFFER_COUNT` for `CONFIG_IDF_TARGET_ESP32S3` unconditionally (not guarded by `#ifndef`), so it always overwrites whatever the compiled model file or build flag sets. The porting header is the authoritative location.
-
-**Fix:** Changed the porting header definition from 30 to 100.
-
----
-
-### Crash 4 — Heap corruption (CORRUPT HEAP: Bad tail)
-
-**Symptom:**
-```
-CORRUPT HEAP: Bad tail at 0x3da25537. Expected 0xbaad5678 got 0x4dc7cf51
-assert failed: multi_heap_free multi_heap_poisoning.c:259 (head != NULL)
-```
-
-Camera initialised successfully, crash occurred during first call to `run_classifier()`.
-
-**Cause:** Two related issues in `AllocatePersistentBufferImpl` (the EON model's arena allocator):
-
-1. **Alignment:** When a scratch buffer fits in the tensor arena, the arena path aligns the pointer to 16 bytes and accounts for padding. When it overflows to `ei_calloc`, it calls `ei_calloc(bytes, 1)` — no alignment, no padding. `heap_caps_calloc` returns 8-byte aligned PSRAM. CMSIS-NN SIMD code writes 16-byte chunks from the (8-byte aligned) pointer and overruns the allocation by up to 8 bytes.
-
-2. **Size:** The arena check subtracts `bytes + align_bytes` to see if the buffer fits, but the overflow path only allocates `bytes`. The missing `align_bytes` are the bytes CMSIS-NN will write past the end.
-
-The corrupted address `0x3da25537` is in the PSRAM virtual address range (`0x3D000000–0x3DFFFFFF`), confirming the stomped canary is on a PSRAM heap allocation.
-
-**Fix:** `ei_calloc` and `ei_malloc` now use `heap_caps_aligned_alloc(16, rounded, MALLOC_CAP_SPIRAM)` where `rounded = (size + 15) & ~15`. This fixes both the pointer alignment and ensures the allocation covers the padding CMSIS-NN assumes is there.
-
----
-
-### PlatformIO build cache issues
-
-When patching library files inside `.pio/`, PlatformIO sometimes uses cached `.a` archives and does not recompile. Symptoms: ELF SHA256 unchanged after an apparently successful build+upload.
-
-**Fix:** Delete the entire `.pio` directory before rebuilding:
-
-```
-rm -rf ~/Documents/hazard_beacon/firmware/hazard_beacon/.pio
-~/.platformio/penv/bin/platformio run --target upload
-```
-
-Also: do not run `platformio run` from two terminals simultaneously (the Bash tool and a terminal). The `.sconsign` dependency tracking file gets corrupted.
-
----
-
-## Build and Flash
+## Build and flash
 
 ```bash
-# Full clean rebuild + upload
-rm -rf ~/Documents/hazard_beacon/firmware/hazard_beacon/.pio
-cd ~/Documents/hazard_beacon/firmware/hazard_beacon
-~/.platformio/penv/bin/platformio run --target upload
+# Clean rebuild + upload
+rm -rf firmware/hazard_beacon/.pio
+cd firmware/hazard_beacon
+pio run --target upload
 
 # Monitor
-~/.platformio/penv/bin/platformio device monitor --baud 115200 \
-    --project-dir ~/Documents/hazard_beacon/firmware/hazard_beacon
+pio device monitor --baud 115200
 ```
-
----
-
-## Known Limitations
-
-- **Domain gap:** Model trained on daytime captures, deployed at night under IR illumination. Scores are meaningless until the model is retrained on nighttime IR data.
-- **iWildCam partial download:** Kaggle API rate limit cut the download at ~642 images out of the intended set.
-- **No FreeRTOS dual-core split yet:** Camera capture and inference run serially on Core 1. Week 6 will move capture to Core 0.
-- **LED not wired yet:** GPIO 21 is defined in firmware but the physical wire has not been run.
-- **`EI_MAX_OVERFLOW_BUFFER_COUNT=30` in platformio.ini:** This build flag is now redundant (the porting header overrides it to 100) but is harmless — produces a warning during compilation.
-
----
-
-## Week 6 Plan
-
-1. **HIL rig** — mount ESP32-S3-EYE + IR illuminator, collect nighttime IR frames of both classes
-2. **Retrain** — upload nighttime frames to Edge Impulse, retrain MobileNetV2, re-export C++ library
-3. **FreeRTOS** — camera on Core 0, inference queue on Core 1
-4. **LED wiring** — run wire from GPIO 21 to yellow LED + resistor
-5. **Threshold tuning** — adjust 0.6 threshold based on real-world precision/recall tradeoff
