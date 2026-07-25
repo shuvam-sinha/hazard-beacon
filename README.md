@@ -16,7 +16,7 @@ Binary classification: **hazard_detected** (a person is present) vs **ambient_no
 
 The camera watches one unchanging scene, so "empty" looks nearly identical frame to frame and anything that differs is what matters. That makes the problem tractable on a microcontroller in a way general-purpose object detection is not — the model only has to separate *this* background from *this* background with a person in it.
 
-That framing hides a subtle trap. With auto-exposure enabled and a bright background, a person entering the frame lowers average brightness; the sensor compensates by raising exposure, which brightens the background. Now **background brightness is correlated with the class label**, and the model happily learns that shortcut instead of learning what a person looks like. It scores beautifully in training and fails in the real world, because the signal was an artifact of the sensor, not the scene.
+That framing hides a subtle trap — and it's the reason the exposure is locked. If auto-exposure were left on, a person entering the frame would lower the average brightness, and the sensor would compensate by raising exposure and brightening the background. **Background brightness would then track the label**, handing the model an easy shortcut: judge the scene by how bright it is rather than by what's in it. Such a shortcut is brittle — it holds only while lighting stays constant and breaks the moment the light changes or something bright but harmless enters view. Locking exposure removes the shortcut, forcing the model to rely on the actual contents of the frame.
 
 The fix is to lock exposure, gain, and white balance so the background renders identically every frame:
 
