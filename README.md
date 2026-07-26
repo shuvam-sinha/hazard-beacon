@@ -122,6 +122,16 @@ It auto-detects the serial port (macOS renumbers `/dev/cu.usbmodem*` between rec
 
 **Target:** Espressif ESP-EYE
 
+### How Edge Impulse works
+
+Edge Impulse is a platform for building TinyML models — collecting data, training in the cloud, and exporting something small enough to run on a microcontroller. Its central concept is an **impulse**: a pipeline of an input block, a signal-processing (DSP) block, and a learning block. For this project the impulse is:
+
+```
+96×96 image  →  Image DSP block (RGB)  →  transfer learning (MobileNetV2 0.35)  →  2 classes
+```
+
+You upload labelled images, design the impulse in the browser, train, check accuracy on a held-out set, then export. Rather than ship the model as a `.tflite` file that a generic interpreter reads at runtime, this project uses Edge Impulse's **EON Compiler**, which compiles the model's operator graph directly into C++ source. There is no interpreter to store or step through — which is why the deployment page reports it using ~18% less RAM and ~21% less flash than the standard TFLite Micro path, at the same accuracy.
+
 ### Impulse configuration
 
 - **Input:** 96×96 image, resize mode **Squash** (avoids the padding artifacts fit/crop introduce)
@@ -148,6 +158,24 @@ On-device performance (int8, ESP32-S3 @ 240 MHz, Edge Impulse estimate):
 | Inference latency | ~1.5 s |
 | Peak RAM | 248.7 KB |
 | Flash | 531.9 KB |
+
+### What gets exported
+
+The "Arduino library" export is a self-contained C++ library, `hazard_beacon_inferencing/`, holding three things:
+
+- **The model** — `tflite-model/tflite_learn_*_compiled.cpp`: the weights and the EON-compiled graph, as code.
+- **Model parameters** — `model-parameters/model_metadata.h` and `model_variables.h`: input dimensions, class labels, thresholds, and quantization parameters.
+- **The runtime SDK** — `edge-impulse-sdk/`: the DSP blocks, the CMSIS-NN kernels that do the actual math, and a **porting layer** that abstracts memory, timing, and printing per target.
+
+The API surface is small: fill a `signal_t` (how many values, plus a callback that supplies them), call `run_classifier()`, and read the scores out of `ei_impulse_result_t.classification[]`.
+
+### Adapting it to the ESP32-S3
+
+The export is generic; making it run on this board took three things:
+
+1. **Feed it the camera.** `run_classifier()` doesn't read the image — it calls back for pixels. The `get_signal_data` callback bridges the camera frame to the model, packing each grayscale byte into RGB (see [Signal callback](#signal-callback)).
+2. **Put the model's memory in PSRAM.** The stock allocators assume the model fits in internal RAM; it doesn't. The porting layer was patched to allocate from PSRAM with correct alignment — see [Memory](#memory-internal-sram-vs-psram) and [SDK patches](#sdk-patches-do-not-revert).
+3. **Keep the watchdog fed** across the multi-second inference call so the chip doesn't reset mid-classification.
 
 ---
 
@@ -217,6 +245,21 @@ A compile-time flag controls whether each classified frame is streamed over seri
 ```
 
 At `1`, the firmware emits `FRAME_START:<len>:<decision>:<hazard>:<ambient>` followed by the raw pixel bytes — required by `receive_frames.py` and `capture_classified_frames.py`. At `0`, serial is clean text only and the capture scripts receive nothing. (At `1`, a plain serial monitor renders the pixel bytes as garbled text; that's expected — read the stream through one of the scripts.)
+
+---
+
+## Memory: internal SRAM vs PSRAM
+
+The ESP32-S3 exposes two kinds of general-purpose RAM, and the split is the whole reason this project needed allocator patches.
+
+- **Internal SRAM — 512 KB, on-chip, fast.** Runs at CPU speed, but it is shared by everything and only a few hundred KB is realistically free.
+  *Stored here:* the Arduino/FreeRTOS runtime and task stacks, and the camera driver's DMA buffers (DMA hardware can only reach internal RAM).
+- **PSRAM (a.k.a. SPIRAM) — 8 MB, external, slower.** A separate memory chip wired over an octal-SPI bus and memory-mapped into the CPU's address space (the `0x3C000000–0x3DFFFFFF` region). Far larger, but every access goes through the bus and cache, so it is slower than internal SRAM. It must be enabled (`-DBOARD_HAS_PSRAM`, `qio_opi` memory type) and explicitly requested with `heap_caps_malloc(..., MALLOC_CAP_SPIRAM)` — a plain `malloc` never touches it.
+  *Stored here:* the model's tensor arena and the CMSIS-NN scratch / overflow buffers (the bulk of the ~249 KB peak), plus the two camera frame buffers.
+- **Flash — 8 MB, non-volatile.** Storage, not RAM.
+  *Stored here:* the compiled firmware, the EON-compiled model weights (read-only constants streamed through cache at runtime), and the partition table.
+
+MobileNetV2's tensor arena and its CMSIS-NN scratch buffers need more contiguous memory than internal SRAM can spare alongside the camera's frame buffers, so the model's working memory has to live in PSRAM. That is exactly what the SDK patches force: every model allocation is routed to `MALLOC_CAP_SPIRAM`. It is also why the crash address in the [debugging log](#debugging-log--the-crash-cascade) (`0x3d…`) was the clue — that range is PSRAM, so the heap overrun had to be on a PSRAM buffer, not internal RAM.
 
 ---
 
