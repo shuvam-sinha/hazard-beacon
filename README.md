@@ -48,7 +48,9 @@ Two rules follow: these calls must run **after** `esp_camera_init()` (settings a
 
 The board is powered and programmed over USB; no external components are attached.
 
-Camera pins (OV2640 on ESP32-S3-EYE — these differ from the board-variant defaults and must be overridden):
+### Camera pins
+
+The OV2640 talks to the ESP32 over a **DVP parallel interface** — a fixed set of clock, control, data, and sync lines. The GPIO numbers below are specific to the ESP32-S3-EYE and differ from the board-variant defaults, which is why `main.cpp` `#undef`s the defaults before defining these:
 
 ```
 XCLK=15  SIOD=4   SIOC=5
@@ -57,6 +59,18 @@ Y5=10    Y4=8     Y3=9     Y2=11
 VSYNC=6  HREF=7   PCLK=13
 PWDN=-1  RESET=-1
 ```
+
+The 16 pins fall into five functional groups:
+
+| Group | Pins | Role |
+|---|---|---|
+| **Master clock** | `XCLK=15` | The ESP32 *generates* this (20 MHz, via the LEDC peripheral) and feeds it into the sensor as its timing reference. Everything the sensor does derives from it. |
+| **SCCB config bus** | `SIOD=4` (data), `SIOC=5` (clock) | An I²C-like bus used at boot to write the sensor's registers — resolution, pixel format, and the exposure/gain lock all go out over these two pins. |
+| **Pixel data bus** | `Y9=16` (MSB) … `Y2=11` (LSB) | 8 parallel lines carrying one 8-bit value per pixel clock tick. In grayscale mode each value *is* a pixel's brightness (0–255). Named `Y2`–`Y9` because the sensor's two lowest data lines aren't used at this bit depth. |
+| **Sync / timing** | `VSYNC=6`, `HREF=7`, `PCLK=13` | `VSYNC` pulses once per **frame**, `HREF` is asserted during each valid **row**, and `PCLK` pulses once per **pixel** — on each `PCLK` tick the 8 data lines are latched. |
+| **Control (unused)** | `PWDN=-1`, `RESET=-1` | Power-down and hardware-reset. Not wired to a controllable GPIO on this board, so `-1` ("not connected") tells the driver to skip them. |
+
+**How they fit together:** at boot, `XCLK` starts the sensor and the driver writes config over `SIOD`/`SIOC`. Then continuously, `VSYNC` marks a new frame; for each row `HREF` goes high; on every `PCLK` tick the 8 data bits (`Y2`–`Y9`) are latched into one pixel. The camera's DMA hardware does this latching, which is why `esp_camera_fb_get()` hands back a finished 96×96 buffer instead of the CPU toggling pins.
 
 ---
 
@@ -81,14 +95,17 @@ hazard_beacon/
 │               └── src/
 │                   ├── tflite-model/         # EON-compiled model
 │                   └── edge-impulse-sdk/     # EI SDK — see SDK Patches
-└── scripts/
-    ├── receive_frames.py             # collect labelled training frames from the device
-    ├── capture_classified_frames.py  # save frames tagged with the model's decision
-    ├── process_dataset.py            # normalise images to 96×96 grayscale PNG
-    ├── augment_dataset.py            # offline augmentation (prefer EI's built-in)
-    ├── image_to_header.py            # PNG → test_image.h for on-device test mode
-    ├── test_eim_model.py             # host-side .eim smoke test on macOS
-    └── test_exported_model.py        # serial-driven on-device inference test
+├── scripts/
+│   ├── receive_frames.py             # collect labelled training frames from the device
+│   ├── capture_classified_frames.py  # save frames tagged with the model's decision
+│   ├── process_dataset.py            # normalise images to 96×96 grayscale PNG
+│   ├── augment_dataset.py            # offline augmentation (prefer EI's built-in)
+│   ├── image_to_header.py            # PNG → test_image.h for on-device test mode
+│   ├── test_eim_model.py             # host-side .eim smoke test on macOS
+│   └── test_exported_model.py        # serial-driven on-device inference test
+└── server/
+    ├── app.py                        # Flask receiver + detection dashboard (port 5001)
+    └── requirements.txt              # flask, pillow
 ```
 
 ---
@@ -129,6 +146,8 @@ Edge Impulse is a platform for building TinyML models — collecting data, train
 ```
 96×96 image  →  Image DSP block (RGB)  →  transfer learning (MobileNetV2 0.35)  →  2 classes
 ```
+
+The **DSP block** (short for digital signal processing — a name inherited from audio projects) is the preprocessing stage between the raw input and the model. It doesn't *learn* anything; it deterministically turns each raw image into the numeric feature vector the network consumes, and it runs **identically during training and on-device inference** — which is the whole point, since the model only works if live camera frames are turned into features the same way the training images were. For images that means applying the color mode, normalising the pixel values, and flattening the result. This project's block is set to **RGB**, producing 96×96×3 = **27,648 features** — even though the camera is grayscale — because the pretrained MobileNetV2 base expects three channels. That single choice is why the firmware packs each grey byte into all three channels (see [Signal callback](#signal-callback)): the pipeline must see the same format at inference time that it saw in training.
 
 You upload labelled images, design the impulse in the browser, train, check accuracy on a held-out set, then export. Rather than ship the model as a `.tflite` file that a generic interpreter reads at runtime, this project uses Edge Impulse's **EON Compiler**, which compiles the model's operator graph directly into C++ source. There is no interpreter to store or step through — which is why the deployment page reports it using ~18% less RAM and ~21% less flash than the standard TFLite Micro path, at the same accuracy.
 
@@ -203,13 +222,18 @@ build_flags =
 
 ### Inference loop
 
-1. `esp_camera_fb_get()` — capture a frame into a DMA buffer
-2. Point `frame_buf_ptr` at the pixel data
-3. Build `signal_t` with the `get_signal_data` callback
-4. `run_classifier_init()`, then `esp_task_wdt_reset()` to feed the watchdog before the multi-second inference call
-5. `run_classifier()` — EON-compiled MobileNetV2
-6. Read `hazard_detected` / `ambient_noise` scores, apply the 0.6 threshold, and print the result over serial
-7. `esp_camera_fb_return(fb)` — release the buffer
+Each pass captures one live frame and classifies it, roughly every ~2 seconds. The three memory regions work together throughout — the block each step touches is called out in **bold** (see [Memory](#memory-internal-sram-vs-psram) for what each one is):
+
+1. `esp_camera_fb_get()` — capture a frame. The camera's DMA latches pixels through small **internal SRAM** buffers (DMA can only reach on-chip RAM) and assembles the 96×96 frame into a frame buffer in **PSRAM**.
+2. Point `frame_buf_ptr` at the pixel data — the frame stays in **PSRAM**; only a pointer is set, on the **SRAM** stack. Nothing is copied.
+3. Build `signal_t` with the `get_signal_data` callback (a small descriptor on the **SRAM** stack).
+4. `run_classifier_init()`, then `esp_task_wdt_reset()` to feed the watchdog before the multi-second inference call.
+5. `run_classifier()` — EON-compiled MobileNetV2. The model's **weights are read from flash** (streamed through cache, never copied to RAM); its **tensor arena and CMSIS-NN scratch buffers live in PSRAM**; and the **CPU drives the math from SRAM**. The DSP block runs first, pulling each pixel from the **PSRAM** frame via the callback (packing grayscale into RGB) and writing the feature vector into the **PSRAM** arena, which the network layers then compute through.
+6. Read `hazard_detected` / `ambient_noise` scores — a few numbers in the `result` struct on the **SRAM** stack — apply the 0.6 threshold, set the LED, and print the result over serial.
+7. On a sustained streak (5 consecutive hazard frames), POST the frame to the server — the raw bytes are read back out of the **PSRAM** frame buffer and sent over WiFi.
+8. `esp_camera_fb_return(fb)` — release the **PSRAM** frame buffer so the next capture can reuse it.
+
+In short: the frame lands in **PSRAM**, the model reads its weights from **flash** and does its scratch work in **PSRAM**, while **SRAM** runs the code and holds the DMA buffers and the final scores.
 
 ### Class label
 
@@ -334,3 +358,29 @@ pio run --target upload
 # Monitor
 pio device monitor --baud 115200
 ```
+
+---
+
+## Roadmap
+
+The on-device pipeline is working end to end — capture, exposure-locked inference, sustained-hazard detection, and upload over WiFi. What's next is mostly about what happens *after* a detection.
+
+### Web dashboard
+
+A minimal dashboard already runs locally (`server/app.py`): a Flask app that receives sustained-hazard frames on the LAN, wraps the raw 96×96 grayscale bytes into timestamped PNGs, and serves an auto-refreshing gallery at `http://<mac-ip>:5001/`. The device has no real clock, so the server timestamps each frame on arrival and encodes the time and score into the filename.
+
+It's a prototype. The next steps grow it into a real dashboard:
+
+- **Device status**, not just a detection gallery — last-seen, WiFi state, whether the scene is currently clear
+- **A metadata store** (SQLite) instead of packing timestamp and score into the filename
+- **Filtering, search, and capture management** — review, label, and delete detections
+- **Push updates** (WebSocket/SSE) in place of the 10-second `<meta refresh>`
+- **Off-network access** — auth and hosting so the dashboard is reachable away from the LAN
+
+### Push notifications
+
+The firmware already carries a Telegram alert path, currently commented out in `main.cpp`. Re-enabling it — or having the server send the push once it receives a frame — makes a detection reach a phone immediately, instead of only landing on the dashboard.
+
+### Nighttime / IR
+
+The exposure lock is tuned for a well-lit daytime scene. The firmware notes the low-light path (raise `AEC_VALUE` / `AGC_GAIN`, set `GAINCEILING_16X`), but doing it properly means recollecting training data under IR illumination and retraining — the model has to be trained at the same exposure it runs at, so a daytime model won't transfer to an IR-lit scene.
